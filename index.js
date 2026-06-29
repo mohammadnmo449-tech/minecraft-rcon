@@ -5,9 +5,21 @@ const app = express();
 app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-hiwa-token');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
+
+// ── Simple token auth for protected endpoints ──
+function requireToken(req, res, next) {
+  const token = req.headers['x-hiwa-token'];
+  if (!process.env.HIWA_AUTH_TOKEN) return next(); // no token configured = open (dev mode)
+  if (token !== process.env.HIWA_AUTH_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
 
 function sendRcon(host, port, password, command) {
   return new Promise((resolve, reject) => {
@@ -16,8 +28,7 @@ function sendRcon(host, port, password, command) {
     let buffer = Buffer.alloc(0);
 
     client.connect(port, host, () => {
-      const passPacket = buildPacket(0, 3, password);
-      client.write(passPacket);
+      client.write(buildPacket(0, 3, password));
     });
 
     client.on('data', (data) => {
@@ -25,14 +36,11 @@ function sendRcon(host, port, password, command) {
       while (buffer.length >= 12) {
         const length = buffer.readInt32LE(0);
         if (buffer.length < length + 4) break;
-        const id = buffer.readInt32LE(4);
-        const type = buffer.readInt32LE(8);
         const body = buffer.slice(12, length + 2).toString('utf8').replace(/\0/g, '');
         buffer = buffer.slice(length + 4);
         if (!authenticated) {
           authenticated = true;
-          const cmdPacket = buildPacket(1, 2, command);
-          client.write(cmdPacket);
+          client.write(buildPacket(1, 2, command));
         } else {
           client.destroy();
           resolve(body);
@@ -55,7 +63,8 @@ function buildPacket(id, type, body) {
   return packet;
 }
 
-app.post('/command', async (req, res) => {
+// ── Raw command (unchanged from original) ──
+app.post('/command', requireToken, async (req, res) => {
   const { command } = req.body;
   if (!command) return res.status(400).json({ error: 'No command' });
   try {
@@ -71,6 +80,70 @@ app.post('/command', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('RCON Server is running!'));
+// ── Shop delivery endpoint: give item to player ──
+// Called by shop.html after a successful purchase on server 0
+// Body: { player: "MinecraftUsername", rcon_command: "give {player} diamond 1" }
+app.post('/deliver', requireToken, async (req, res) => {
+  const { player, rcon_command } = req.body;
 
-app.listen(process.env.PORT || 3000, () => console.log('Server started'));
+  if (!player || !rcon_command) {
+    return res.status(400).json({ error: 'Missing player or rcon_command' });
+  }
+
+  // Sanitize player name (only allow alphanumeric + underscore, max 16 chars)
+  if (!/^[a-zA-Z0-9_]{1,16}$/.test(player)) {
+    return res.status(400).json({ error: 'Invalid Minecraft username' });
+  }
+
+  // Replace {player} placeholder with actual username
+  const finalCommand = rcon_command.replace(/\{player\}/g, player);
+
+  try {
+    const result = await sendRcon(
+      process.env.RCON_HOST,
+      parseInt(process.env.RCON_PORT),
+      process.env.RCON_PASSWORD,
+      finalCommand
+    );
+    res.json({ success: true, result, command: finalCommand });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Multi-deliver: send multiple commands at once (for kits) ──
+app.post('/deliver-kit', requireToken, async (req, res) => {
+  const { player, commands } = req.body;
+
+  if (!player || !Array.isArray(commands) || commands.length === 0) {
+    return res.status(400).json({ error: 'Missing player or commands array' });
+  }
+  if (!/^[a-zA-Z0-9_]{1,16}$/.test(player)) {
+    return res.status(400).json({ error: 'Invalid Minecraft username' });
+  }
+
+  const results = [];
+  for (const cmd of commands) {
+    try {
+      const finalCmd = cmd.replace(/\{player\}/g, player);
+      const result = await sendRcon(
+        process.env.RCON_HOST,
+        parseInt(process.env.RCON_PORT),
+        process.env.RCON_PASSWORD,
+        finalCmd
+      );
+      results.push({ command: finalCmd, result, ok: true });
+    } catch (e) {
+      results.push({ command: cmd, error: e.message, ok: false });
+    }
+  }
+
+  const allOk = results.every(r => r.ok);
+  res.json({ success: allOk, results });
+});
+
+app.get('/', (req, res) => res.send('HIWA RCON Bridge is running!'));
+
+app.listen(38674, () => {
+  console.log('HIWA RCON Bridge on port 38674');
+});
